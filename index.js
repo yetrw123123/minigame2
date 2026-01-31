@@ -229,6 +229,41 @@ app.get("/api/share/stats", async (req, res) => {
   }
 });
 
+// ============ 新增：获取服务器当前日期接口 ============
+app.get("/api/current_date", async (req, res) => {
+  try {
+    const now = new Date();
+    
+    // 返回多种格式，方便不同需求使用
+    res.send({
+      code: 0,
+      message: "success",
+      data: {
+        // 标准ISO字符串，带时区信息
+        iso: now.toISOString(),          
+        // 简化日期字符串，适合用于“按天”比较（YYYY-MM-DD）
+        date: now.toISOString().split('T')[0],
+        // 本地时间字符串，便于阅读
+        local: now.toString(),            
+        // 时间戳（毫秒），精确比较
+        timestamp: now.getTime(),         
+        // 年、月、日单独字段，方便业务逻辑
+        year: now.getFullYear(),
+        month: now.getMonth() + 1,       // 月份从0开始，所以+1
+        day: now.getDate(),
+        dayOfWeek: now.getDay()          // 周日=0，周一=1，...
+      }
+    });
+  } catch (error) {
+    console.error('获取日期失败:', error);
+    res.send({ 
+    code: 500, 
+    message: "获取服务器日期失败" 
+  });
+  }
+});
+
+
 // ============ 自定义接口 END ============
 
 const port = process.env.PORT || 80;
