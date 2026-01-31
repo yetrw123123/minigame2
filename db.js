@@ -81,6 +81,54 @@ const ShareInvite = sequelize.define("ShareInvite", {
   ]
 });
 
+
+// ============ 新增：每日排行榜模型（含角色ID）============
+const DailyRank = sequelize.define("DailyRank", {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true,
+  },
+  playerName: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  // 角色ID，记录玩家使用的角色
+  roleID: {
+    type: DataTypes.INTEGER,
+    allowNull: false,
+    defaultValue: 1, // 假设默认角色ID为1
+  },
+  // 关卡进度ID
+  instanceID: {
+    type: DataTypes.INTEGER,
+    allowNull: false,
+    defaultValue: 0,
+  },
+  // 玩家标识
+  openid: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  // 北京日期，用于每日清空
+  recordDate: {
+    type: DataTypes.STRING(10),
+    allowNull: false,
+    comment: '北京日期 (YYYY-MM-DD)'
+  }
+}, {
+  indexes: [
+    // 按 instanceID 排序（排行榜核心排序）
+    {
+      fields: ['instanceID']
+    },
+    // 按日期查询（用于每日清空）
+    {
+      fields: ['recordDate']
+    }
+  ]
+});
+
 // 数据库初始化方法
 async function init() {
   try {
@@ -88,11 +136,14 @@ async function init() {
     await Counter.sync({ alter: true });
     console.log('Counter 表同步成功');
     
-    await GameSave.sync({ alter: true }); // 重点检查这里
+    await GameSave.sync({ alter: true }); 
     console.log('GameSave 表同步成功');
 
-    await ShareInvite.sync({ alter: true });     // 新增：同步分享邀请记录表
+    await ShareInvite.sync({ alter: true });
     console.log('ShareInvite 表同步成功');
+
+    await DailyRank.sync({ alter: true });
+    console.log('DailyRank 表同步成功');
     
   } catch (error) {
     // 捕获并打印详细的错误信息
@@ -145,7 +196,8 @@ module.exports = {
   init,
   Counter,
   GameSave,
-  ShareInvite,      
+  ShareInvite,
+  DailyRank,      
   recordShareInvite, 
   getInviteCount     
 };
