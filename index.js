@@ -455,8 +455,7 @@ app.post("/api/rank/submit", async (req, res) => {
         recordDate: beijingDateToday,
         playerName: playerName.trim(),
         roleID: roleID,
-        instanceID: instanceID,
-        createdAt: now
+        instanceID: instanceID
       });
       isNew = true;
     }
