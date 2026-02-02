@@ -10,7 +10,9 @@ const {
   ShareInvite,
   DailyRank,
   recordShareInvite,
-  getInviteCount
+  getInviteCount,
+  trimTodayRank,
+  getBeijingDateString  // 从 db.js 导入
 } = require("./db");
 const { Op } = require("sequelize");
 
@@ -22,17 +24,134 @@ app.use(express.json());
 app.use(cors());
 app.use(logger);
 
+// 在顶部添加这个声明
+let isCleaning = false;
+let lastCleanupDay = null;
 
-/**
- * 获取当前北京时间 (UTC+8) 的日期字符串
- */
-function getBeijingDateString() {
-  const now = new Date();
-  // 获取当前 UTC 时间戳，加上 8 小时的毫秒数，得到北京时间戳
-  const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  return beijingTime.toISOString().split('T')[0];
+// 每日清理函数
+function setupDailyCleanup() {
+  console.log('设置每日零点清理任务...');
+  
+  // 每分钟检查一次
+  setInterval(async () => {
+    const today = getBeijingDateString();
+    const beijingHour = getBeijingHour();
+    
+    // 如果是凌晨0点，且今天还没清理过
+    if (beijingHour === 0 && lastCleanupDay !== today) {
+      console.log(`[${new Date().toISOString()}] 北京时间零点，执行清理`);
+      lastCleanupDay = today;
+      await cleanupOldRanks();
+      
+      // 清理后立即修剪今日排行榜
+      await trimTodayRank(today);
+    }
+  }, 60 * 1000);
+  
+  // 服务器启动后立即检查一次
+  setTimeout(async () => {
+    console.log('服务器启动，执行首次数据检查...');
+    await cleanupOldRanks();
+    lastCleanupDay = getBeijingDateString();
+    
+    // 启动时也修剪一下今日排行榜
+    const today = getBeijingDateString();
+    await trimTodayRank(today);
+  }, 10000);
+  
+  // 每5分钟修剪一次今日排行榜（防止数据过多）
+  setInterval(async () => {
+    const today = getBeijingDateString();
+    await trimTodayRank(today);
+  }, 5 * 60 * 1000);
 }
 
+/**
+ * 获取北京时间的小时数
+ */
+function getBeijingHour() {
+  const now = new Date();
+  const utcHour = now.getUTCHours();
+  return (utcHour + 8) % 24; // 北京=UTC+8
+}
+
+// 清理旧数据函数
+async function cleanupOldRanks() {
+  // 防止重复执行
+  if (isCleaning) {
+    console.log('清理任务正在运行，跳过本次执行');
+    return;
+  }
+  
+  isCleaning = true;
+  
+  try {
+    const today = getBeijingDateString();
+    const result = await DailyRank.destroy({
+      where: {
+        recordDate: { [Op.ne]: today }
+      }
+    });
+    
+    if (result > 0) {
+      console.log(`[${new Date().toISOString()}] 清理了 ${result} 条旧排行榜数据`);
+    } else {
+      console.log(`[${new Date().toISOString()}] 没有需要清理的旧数据`);
+    }
+  } catch (error) {
+    console.error('清理旧数据失败:', error);
+  } finally {
+    isCleaning = false;
+  }
+}
+
+/**
+ * 获取玩家在今日排行榜中的排名
+ * 如果不在前100名内，返回null
+ */
+async function getPlayerRank(openid, today) {
+  try {
+    // 获取今日前100名
+    const top100 = await DailyRank.findAll({
+      where: { recordDate: today },
+      order: [
+        ['instanceID', 'DESC'],
+        ['createdAt', 'ASC']
+      ],
+      limit: 100
+    });
+    
+    // 查找玩家在列表中的位置
+    const playerIndex = top100.findIndex(record => record.openid === openid);
+    
+    if (playerIndex === -1) {
+      return null; // 未上榜
+    }
+    
+    // 处理同分情况
+    const playerScore = top100[playerIndex].instanceID;
+    const playerCreatedAt = top100[playerIndex].createdAt;
+    
+    // 计算比玩家分数高的记录数
+    let higherCount = 0;
+    for (const record of top100) {
+      if (record.instanceID > playerScore) {
+        higherCount++;
+      } else if (record.instanceID === playerScore && 
+                 new Date(record.createdAt) < new Date(playerCreatedAt)) {
+        // 同分但创建时间更早
+        higherCount++;
+      } else {
+        break; // 后面的记录分数不会更高
+      }
+    }
+    
+    return higherCount + 1;
+  } catch (error) {
+    console.error('计算排名失败:', error);
+    return null;
+  }
+}
 
 // 首页
 app.get("/", async (req, res) => {
@@ -89,13 +208,12 @@ app.post("/api/save_data", async (req, res) => {
   }
 
   try {
-    // 使用 upsert 方法：如果该 openid 的记录存在则更新，不存在则创建
     const [record, created] = await GameSave.upsert({
       openid: openid,
-      gameData: JSON.stringify(gameData), // 将对象转为JSON字符串存储
+      gameData: JSON.stringify(gameData),
       updatedAt: new Date()
     }, {
-      returning: true // 返回操作后的记录
+      returning: true
     });
 
     console.log(`用户 ${openid} 存档${created ? '新建' : '更新'}成功`);
@@ -119,21 +237,19 @@ app.get("/api/load_data", async (req, res) => {
   }
 
   try {
-    const record = await GameSave.findByPk(openid); // 用主键 openid 查找
+    const record = await GameSave.findByPk(openid);
 
     if (record) {
-      // 找到存档，解析并返回
       res.send({
         code: 0,
         message: "存档加载成功",
         data: {
           hasData: true,
-          gameData: JSON.parse(record.gameData), // 将字符串解析回对象
+          gameData: JSON.parse(record.gameData),
           updatedAt: record.updatedAt
         }
       });
     } else {
-      // 没有找到存档，返回默认数据
       const defaultData = { gold: 100, instanceID: 0, items: [] };
       res.send({
         code: 0,
@@ -151,7 +267,7 @@ app.get("/api/load_data", async (req, res) => {
 });
 
 app.post("/api/share/record", async (req, res) => {
-  const {inviteeOpenId, inviterOpenId, scene } = req.body; // 受邀者OpenId，邀请者OpenId
+  const {inviteeOpenId, inviterOpenId, scene } = req.body;
   
   if (!inviterOpenId) {
     return res.send({ code: 401, message: "未获取到分享者身份" });
@@ -160,7 +276,6 @@ app.post("/api/share/record", async (req, res) => {
     return res.send({ code: 400, message: "缺少被邀请者信息" });
   }
   
-  // 防止自己邀请自己
   if (inviterOpenId === inviteeOpenId) {
     return res.send({ code: 400, message: "不能邀请自己" });
   }
@@ -176,7 +291,7 @@ app.post("/api/share/record", async (req, res) => {
         message: "分享记录成功",
         data: {
           inviteId: invite.id,
-          totalInvites: totalInvites, // 现在这个变量已定义
+          totalInvites: totalInvites,
         }
       });
     } else {
@@ -198,17 +313,15 @@ app.post("/api/share/record", async (req, res) => {
 
 // 获取分享统计数据接口
 app.get("/api/share/stats", async (req, res) => {
-  const openid = req.headers["x-wx-openid"]; // 获取当前用户的openid
+  const openid = req.headers["x-wx-openid"];
   
   if (!openid) {
     return res.send({ code: 401, message: "未获取到用户身份" });
   }
 
   try {
-    // 获取该用户的总邀请人数
     const inviteCount = await getInviteCount(openid);
     
-    // 可选：获取详细的邀请记录列表
     const inviteList = await ShareInvite.findAll({
       where: {
         inviterOpenId: openid,
@@ -216,7 +329,7 @@ app.get("/api/share/stats", async (req, res) => {
       },
       attributes: ['id', 'inviteeOpenId', 'createdAt', 'extraInfo'],
       order: [['createdAt', 'DESC']],
-      limit: 50 // 限制返回数量
+      limit: 50
     });
     
     res.send({
@@ -227,7 +340,7 @@ app.get("/api/share/stats", async (req, res) => {
         totalInvites: inviteCount,
         inviteList: inviteList.map(item => ({
           id: item.id,
-          inviteeOpenId: item.inviteeOpenId.substring(0, 8) + '...', // 隐藏部分ID保护隐私
+          inviteeOpenId: item.inviteeOpenId.substring(0, 8) + '...',
           inviteDate: item.createdAt,
           scene: item.extraInfo ? JSON.parse(item.extraInfo).scene : null
         }))
@@ -243,119 +356,156 @@ app.get("/api/share/stats", async (req, res) => {
   }
 });
 
-// ============ 新增：获取服务器当前日期接口 ============
+// ============ 获取服务器当前日期接口 ============
 app.get("/api/current_date", async (req, res) => {
   try {
     const now = new Date();
     
-    // 返回多种格式，方便不同需求使用
     res.send({
       code: 0,
       message: "success",
       data: {
-        // 标准ISO字符串，带时区信息
         iso: now.toISOString(),          
-        // 简化日期字符串，适合用于“按天”比较（YYYY-MM-DD）
         date: getBeijingDateString(),
-        // 本地时间字符串，便于阅读
         local: now.toString(),            
-        // 时间戳（毫秒），精确比较
         timestamp: now.getTime(),         
-        // 年、月、日单独字段，方便业务逻辑
         year: now.getFullYear(),
-        month: now.getMonth() + 1,       // 月份从0开始，所以+1
+        month: now.getMonth() + 1,
         day: now.getDate(),
-        dayOfWeek: now.getDay()          // 周日=0，周一=1，...
+        dayOfWeek: now.getDay()
       }
     });
   } catch (error) {
     console.error('获取日期失败:', error);
     res.send({ 
-    code: 500, 
-    message: "获取服务器日期失败" 
-  });
+      code: 500, 
+      message: "获取服务器日期失败" 
+    });
   }
 });
 
-// ============ 新增：每日排行榜接口 ============
+// ============ 每日排行榜接口 ============
 
-// 接口1：上传/更新我的成绩
+// 接口1：上传/更新成绩
 app.post("/api/rank/submit", async (req, res) => {
   const openid = req.headers["x-wx-openid"];
   const { playerName, instanceID, roleID = 1 } = req.body;
 
   if (!openid) {
-    return res.send({ code: 401, message: "未获取到用户身份" });
+    return res.status(401).json({ 
+      code: 401, 
+      message: "未获取到用户身份" 
+    });
   }
   if (!playerName || playerName.trim() === '') {
-    return res.send({ code: 400, message: "玩家名字不能为空" });
+    return res.status(400).json({ 
+      code: 400, 
+      message: "玩家名字不能为空" 
+    });
   }
   if (typeof instanceID !== 'number' || instanceID < 0) {
-    return res.send({ code: 400, message: "instanceID 必须为非负数字" });
-  }
-  if (typeof roleID !== 'number' || roleID < 0) {
-    return res.send({ code: 400, message: "roleID 必须为非负数字" });
+    return res.status(400).json({ 
+      code: 400, 
+      message: "instanceID 必须为非负数字" 
+    });
   }
 
   try {
     const beijingDateToday = getBeijingDateString();
+    const now = new Date();
 
-    // 使用 upsert：如果该玩家今天已有记录，则更新；没有则创建
-    const [record, created] = await DailyRank.upsert({
-      openid: openid,
-      recordDate: beijingDateToday,
-      playerName: playerName.trim(),
-      roleID: roleID,
-      instanceID: instanceID
-    }, {
-      returning: true
+    // 检查玩家今日是否已有记录
+    const existingRecord = await DailyRank.findOne({
+      where: {
+        openid: openid,
+        recordDate: beijingDateToday
+      }
     });
 
-    console.log(`[${beijingDateToday}] 玩家 ${playerName} (角色${roleID}) ${created ? '创建' : '更新'}了成绩: ${instanceID}`);
-    res.send({
+    let record;
+    let isNew = false;
+    
+    if (existingRecord) {
+      // 只保留更高的分数
+      if (instanceID > existingRecord.instanceID) {
+        await existingRecord.update({
+          playerName: playerName.trim(),
+          roleID: roleID,
+          instanceID: instanceID
+        });
+        record = existingRecord;
+      } else {
+        // 分数没超过，不更新
+        return res.json({
+          code: 0,
+          message: "分数未超过当前记录，不更新",
+          data: {
+            playerName: existingRecord.playerName,
+            roleID: existingRecord.roleID,
+            instanceID: existingRecord.instanceID,
+            date: existingRecord.recordDate,
+            isUpdated: false
+          }
+        });
+      }
+    } else {
+      // 创建新记录
+      record = await DailyRank.create({
+        openid: openid,
+        recordDate: beijingDateToday,
+        playerName: playerName.trim(),
+        roleID: roleID,
+        instanceID: instanceID,
+        createdAt: now
+      });
+      isNew = true;
+    }
+
+    // 修剪排行榜，只保留前100名
+    await trimTodayRank(beijingDateToday);
+    
+    // 计算当前排名
+    const rank = await getPlayerRank(openid, beijingDateToday);
+
+    console.log(`[${beijingDateToday}] 玩家 ${playerName} (角色${roleID}) ${isNew ? '创建' : '更新'}了成绩: ${instanceID}, 排名: ${rank || '未上榜'}`);
+    
+    res.json({
       code: 0,
-      message: created ? "成绩已记录" : "成绩已更新",
+      message: isNew ? "成绩已记录" : "成绩已更新",
       data: {
         playerName: record.playerName,
         roleID: record.roleID,
         instanceID: record.instanceID,
+        rank: rank, // null表示未上榜
+        isOnRank: rank !== null,
         date: record.recordDate
       }
     });
 
   } catch (error) {
     console.error('提交排行榜失败:', error);
-    res.send({ 
+    res.status(500).json({ 
       code: 500, 
       message: "提交成绩失败"
     });
   }
 });
 
-// 接口2：获取今日排行榜
+// 接口2：获取今日排行榜（前100名）
 app.get("/api/rank/list", async (req, res) => {
   const openid = req.headers["x-wx-openid"];
   const beijingDateToday = getBeijingDateString();
 
   try {
-    // 清空逻辑：删除所有不是今天北京日期的记录
-    const deleteResult = await DailyRank.destroy({
-      where: {
-        recordDate: {
-          [Op.ne]: beijingDateToday // Op.ne 表示"不等于"
-        }
-      }
-    });
-    if (deleteResult > 0) {
-      console.log(`[${beijingDateToday}] 已清空 ${deleteResult} 条过往日期的排行榜数据。`);
-    }
-
-    // 获取今日（北京日期）所有成绩，按 instanceID 降序
+    // 获取今日排行榜前100名
     const rankList = await DailyRank.findAll({
       where: { 
         recordDate: beijingDateToday
       },
-      order: [['instanceID', 'DESC']],
+      order: [
+        ['instanceID', 'DESC'],
+        ['createdAt', 'ASC'] // 同分按创建时间排序
+      ],
       limit: 100
     });
 
@@ -364,7 +514,8 @@ app.get("/api/rank/list", async (req, res) => {
       rank: index + 1,
       playerName: item.playerName,
       roleID: item.roleID,
-      instanceID: item.instanceID
+      instanceID: item.instanceID,
+      isSelf: openid && item.openid === openid
     }));
 
     // 计算当前玩家排名
@@ -372,20 +523,20 @@ app.get("/api/rank/list", async (req, res) => {
     let myScore = null;
     let myRoleID = null;
     if (openid) {
-      const myRecord = rankList.find(item => item.openid === openid);
-      if (myRecord) {
-        myRank = rankList.findIndex(item => item.openid === openid) + 1;
-        myScore = myRecord.instanceID;
-        myRoleID = myRecord.roleID;
+      const playerIndex = rankList.findIndex(item => item.openid === openid);
+      if (playerIndex !== -1) {
+        myRank = playerIndex + 1;
+        myScore = rankList[playerIndex].instanceID;
+        myRoleID = rankList[playerIndex].roleID;
       }
     }
 
-    res.send({
+    res.json({
       code: 0,
       message: "获取排行榜成功",
       data: {
         list: processedList,
-        myRank: myRank,
+        myRank: myRank, // null表示未上榜
         myScore: myScore,
         myRoleID: myRoleID,
         date: beijingDateToday
@@ -394,20 +545,136 @@ app.get("/api/rank/list", async (req, res) => {
 
   } catch (error) {
     console.error('获取排行榜失败:', error);
-    res.send({ 
+    res.status(500).json({ 
       code: 500, 
       message: "获取排行榜失败"
     });
   }
 });
+
+// 接口3：获取玩家自己数据
+app.get("/api/rank/my", async (req, res) => {
+  const openid = req.headers["x-wx-openid"];
+  const beijingDateToday = getBeijingDateString();
+
+  if (!openid) {
+    return res.status(401).json({ 
+      code: 401, 
+      message: "未获取到用户身份" 
+    });
+  }
+
+  try {
+    // 获取玩家今日记录
+    const playerRecord = await DailyRank.findOne({
+      where: { 
+        openid: openid,
+        recordDate: beijingDateToday 
+      }
+    });
+
+    if (!playerRecord) {
+      // 玩家今日未上榜
+      return res.json({
+        code: 0,
+        data: {
+          onRank: false,
+          message: "今日未上榜",
+          date: beijingDateToday
+        }
+      });
+    }
+
+    // 计算排名
+    const rank = await getPlayerRank(openid, beijingDateToday);
+    
+    if (rank === null) {
+      // 不在前100名内
+      return res.json({
+        code: 0,
+        data: {
+          onRank: false,
+          score: playerRecord.instanceID,
+          playerName: playerRecord.playerName,
+          roleID: playerRecord.roleID,
+          message: "未进入前100名",
+          date: beijingDateToday
+        }
+      });
+    }
+
+    // 返回上榜数据
+    res.json({
+      code: 0,
+      data: {
+        onRank: true,
+        rank: rank,
+        score: playerRecord.instanceID,
+        playerName: playerRecord.playerName,
+        roleID: playerRecord.roleID,
+        date: beijingDateToday
+      }
+    });
+
+  } catch (error) {
+    console.error('查询个人排名失败:', error);
+    res.status(500).json({ 
+      code: 500, 
+      message: "查询失败"
+    });
+  }
+});
+
+// 新增接口：获取排行榜统计信息（调试用）
+app.get("/api/rank/stats", async (req, res) => {
+  const beijingDateToday = getBeijingDateString();
+  
+  try {
+    // 获取今日记录总数
+    const totalCount = await DailyRank.count({
+      where: { recordDate: beijingDateToday }
+    });
+    
+    // 获取前100名的最低分数
+    const rankList = await DailyRank.findAll({
+      where: { recordDate: beijingDateToday },
+      order: [['instanceID', 'DESC']],
+      limit: 100
+    });
+    
+    const minScoreInTop100 = rankList.length > 0 ? rankList[rankList.length - 1].instanceID : 0;
+    
+    res.json({
+      code: 0,
+      data: {
+        date: beijingDateToday,
+        totalPlayers: totalCount,
+        top100MinScore: minScoreInTop100,
+        top100Count: Math.min(100, totalCount)
+      }
+    });
+  } catch (error) {
+    console.error('获取排行榜统计失败:', error);
+    res.status(500).json({ 
+      code: 500, 
+      message: "获取统计失败"
+    });
+  }
+});
+
 // ============ 自定义接口 END ============
 
 const port = process.env.PORT || 80;
 
 async function bootstrap() {
   await initDB();
+
+  // 设置每日凌晨的清理任务
+  setupDailyCleanup();
+
   app.listen(port, () => {
-    console.log("启动成功", port);
+    console.log("启动成功，端口:", port);
+    console.log("当前北京时间:", getBeijingDateString());
   });
 }
 
